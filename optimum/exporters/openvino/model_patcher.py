@@ -332,6 +332,90 @@ def register_ov_batched_mm(patcher):
     patcher._model.set_experts_implementation("ov_batched_mm")
 
 
+# Patched version of grouped_mm_experts_forward from transformers.integrations.moe.
+# Replaces torch.histc / torch.bincount with scatter_add_ to count tokens per expert.
+# Neither torch.histc nor torch.bincount is supported by the OV TorchScript frontend;
+# scatter_add_ on a zeros buffer is semantically equivalent and traces cleanly.
+def ov_grouped_mm_experts_forward(
+    self: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    import transformers.integrations.moe as _moe_module
+
+    device = hidden_states.device
+    num_top_k = top_k_index.size(-1)
+    num_tokens = hidden_states.size(0)
+    hidden_dim = hidden_states.size(-1)
+
+    token_idx = torch.arange(num_tokens, device=device).unsqueeze(1).expand(-1, num_top_k).reshape(-1)
+    sample_weights = top_k_weights.reshape(-1)
+    expert_ids = top_k_index.reshape(-1)
+
+    selected_hidden_states = hidden_states[token_idx]
+
+    perm = torch.argsort(expert_ids)
+    inv_perm = torch.argsort(perm)
+    expert_ids_g = expert_ids[perm]
+    sample_weights_g = sample_weights[perm]
+    selected_hidden_states_g = selected_hidden_states[perm]
+
+    selected_gate_up = self.gate_up_proj
+    selected_down = self.down_proj
+    selected_gate_up_bias = self.gate_up_proj_bias[expert_ids_g] if self.has_bias else None
+    selected_down_bias = self.down_proj_bias[expert_ids_g] if self.has_bias else None
+
+    # PATCH: scatter_add_ instead of histc/bincount - OV TorchScript supports scatter_add_
+    tokens_per_expert = torch.zeros(self.num_experts, dtype=torch.int32, device=device)
+    ones = torch.ones(expert_ids_g.size(0), dtype=torch.int32, device=device)
+    tokens_per_expert.scatter_add_(0, expert_ids_g, ones)
+    offsets = torch.cumsum(tokens_per_expert, dim=0, dtype=torch.int32)
+
+    gate_up_out = _moe_module._grouped_linear(
+        selected_hidden_states_g, selected_gate_up, selected_gate_up_bias, offsets, is_transposed=self.is_transposed
+    )
+
+    gated_out = self._apply_gate(gate_up_out)
+
+    out_per_sample_g = _moe_module._grouped_linear(
+        gated_out, selected_down, selected_down_bias, offsets, is_transposed=self.is_transposed
+    )
+
+    out_per_sample_g = out_per_sample_g * sample_weights_g.unsqueeze(-1)
+    out_per_sample = out_per_sample_g[inv_perm]
+    final_hidden_states = out_per_sample.view(num_tokens, num_top_k, hidden_dim).sum(dim=1)
+
+    return final_hidden_states.to(hidden_states.dtype)
+
+
+def register_ov_grouped_mm(patcher):
+    """Patch grouped_mm_experts_forward to use scatter_add_ instead of torch.histc/bincount.
+
+    The stock implementation uses torch.histc (or torch.bincount) to compute per-expert token
+    counts, which the OV TorchScript frontend does not support. This helper swaps in the
+    OV-compatible scatter_add_ variant while keeping the grouped_mm dispatch key so that
+    hardware-accelerated grouped GEMM paths remain available on supported devices.
+    """
+    import transformers.integrations.moe as moe_module
+    from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
+
+    patcher._orig_grouped_mm_experts_forward = moe_module.grouped_mm_experts_forward
+    moe_module.grouped_mm_experts_forward = ov_grouped_mm_experts_forward
+    ALL_EXPERTS_FUNCTIONS._global_mapping["grouped_mm"] = ov_grouped_mm_experts_forward
+    patcher._model.set_experts_implementation("grouped_mm")
+
+
+def unregister_ov_grouped_mm(patcher):
+    """Restore grouped_mm_experts_forward to its original implementation."""
+    import transformers.integrations.moe as moe_module
+    from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
+
+    orig = patcher._orig_grouped_mm_experts_forward
+    moe_module.grouped_mm_experts_forward = orig
+    ALL_EXPERTS_FUNCTIONS._global_mapping["grouped_mm"] = orig
+
+
 def patch_update_causal_mask(
     model, transformers_version, inner_model_name="model", patch_fn=None, patch_extrnal_model=False
 ):
@@ -9710,20 +9794,29 @@ class Qwen3_5MoeModelPatcher(Qwen3_5ModelPatcher):
         from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeSparseMoeBlock
 
         super().__enter__()
-        for decoder_layer in self._text_model.layers:
-            if isinstance(decoder_layer.mlp, Qwen3_5MoeSparseMoeBlock):
-                sparse_moe_block = decoder_layer.mlp
-                sparse_moe_block._orig_forward = sparse_moe_block.forward
-                sparse_moe_block.forward = types.MethodType(patched_qwen3_5_moe_sparse_moe_block, sparse_moe_block)
+        # When the model exposes set_experts_implementation (generic Experts class), patch
+        # grouped_mm_experts_forward to use scatter_add_ instead of torch.histc/bincount,
+        # which are not supported by the OV TorchScript frontend.
+        if hasattr(self._model, "set_experts_implementation"):
+            register_ov_grouped_mm(self)
+        else:
+            for decoder_layer in self._text_model.layers:
+                if isinstance(decoder_layer.mlp, Qwen3_5MoeSparseMoeBlock):
+                    sparse_moe_block = decoder_layer.mlp
+                    sparse_moe_block._orig_forward = sparse_moe_block.forward
+                    sparse_moe_block.forward = types.MethodType(patched_qwen3_5_moe_sparse_moe_block, sparse_moe_block)
 
     def __exit__(self, exc_type, exc_value, traceback):
         from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeSparseMoeBlock
 
         super().__exit__(exc_type, exc_value, traceback)
-        for decoder_layer in self._text_model.layers:
-            if isinstance(decoder_layer.mlp, Qwen3_5MoeSparseMoeBlock):
-                sparse_moe_block = decoder_layer.mlp
-                sparse_moe_block.forward = sparse_moe_block._orig_forward
+        if hasattr(self, "_orig_grouped_mm_experts_forward"):
+            unregister_ov_grouped_mm(self)
+        else:
+            for decoder_layer in self._text_model.layers:
+                if isinstance(decoder_layer.mlp, Qwen3_5MoeSparseMoeBlock):
+                    sparse_moe_block = decoder_layer.mlp
+                    sparse_moe_block.forward = sparse_moe_block._orig_forward
 
 
 class Qwen3ASRModelPatcher(OVSeq2SeqModelPatcher):
