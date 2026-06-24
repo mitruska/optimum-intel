@@ -333,6 +333,7 @@ def register_ov_batched_mm(patcher):
 
 
 # Patched version of grouped_mm_experts_forward from transformers.integrations.moe.
+# Original code: https://github.com/huggingface/transformers/blob/d557ef55b6df9fc28bc1df49309ffb56d5789992/src/transformers/integrations/moe.py#L380-L385
 # Replaces torch.histc / torch.bincount with scatter_add_ to count tokens per expert.
 # Neither torch.histc nor torch.bincount is supported by the OV TorchScript frontend;
 # scatter_add_ on a zeros buffer is semantically equivalent and traces cleanly.
@@ -353,13 +354,10 @@ def ov_grouped_mm_experts_forward(
     sample_weights = top_k_weights.reshape(-1)
     expert_ids = top_k_index.reshape(-1)
 
-    selected_hidden_states = hidden_states[token_idx]
-
     perm = torch.argsort(expert_ids)
     inv_perm = torch.argsort(perm)
     expert_ids_g = expert_ids[perm]
-    sample_weights_g = sample_weights[perm]
-    selected_hidden_states_g = selected_hidden_states[perm]
+    selected_hidden_states_g = hidden_states[token_idx[perm]]
 
     selected_gate_up = self.gate_up_proj
     selected_down = self.down_proj
@@ -382,8 +380,7 @@ def ov_grouped_mm_experts_forward(
         gated_out, selected_down, selected_down_bias, offsets, is_transposed=self.is_transposed
     )
 
-    out_per_sample_g = out_per_sample_g * sample_weights_g.unsqueeze(-1)
-    out_per_sample = out_per_sample_g[inv_perm]
+    out_per_sample = out_per_sample_g[inv_perm] * sample_weights.unsqueeze(-1)
     final_hidden_states = out_per_sample.view(num_tokens, num_top_k, hidden_dim).sum(dim=1)
 
     return final_hidden_states.to(hidden_states.dtype)
